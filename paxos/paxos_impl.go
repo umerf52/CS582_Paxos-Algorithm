@@ -15,12 +15,12 @@ var RETRY_TIMEOUT = 1 * time.Second
 
 type paxosNode struct {
 	// TODO: implement this!
-	listener      net.Listener
-	hostMap       map[int]string
-	srvID         int
-	isReplacement bool
-	myHostPort    string
-	connections   map[int]*rpc.Client
+	listener               net.Listener
+	hostMap                map[int]string
+	srvID, lastProposalNum int
+	isReplacement          bool
+	myHostPort             string
+	connections            map[int]*rpc.Client
 }
 
 // Desc:
@@ -54,6 +54,7 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 	go http.Serve(node.listener, nil)
 
 	node.connections = make(map[int]*rpc.Client)
+	node.hostMap = make(map[int]string)
 
 	for k, v := range hostMap {
 		for i := 0; i < numRetries; i++ {
@@ -74,6 +75,7 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 	node.myHostPort = myHostPort
 	node.hostMap = hostMap
 	node.srvID = srvID
+	node.lastProposalNum = srvID
 	node.isReplacement = replace
 
 	return node, nil
@@ -88,7 +90,11 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 // args: the key to propose
 // reply: the next proposal number for the given key
 func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, reply *paxosrpc.ProposalNumberReply) error {
-	return errors.New("not implemented")
+	nextProposalNum := pn.lastProposalNum*len(pn.hostMap) + pn.lastProposalNum
+	pn.lastProposalNum = nextProposalNum
+	reply.N = nextProposalNum
+	return nil
+	// return errors.New("not implemented")
 }
 
 // Desc:
