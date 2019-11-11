@@ -1,3 +1,4 @@
+// High level logic discussed with 2020-10-0231
 package paxos
 
 import (
@@ -10,17 +11,29 @@ import (
 	"time"
 )
 
+// Time after Propose() fails
 var PROPOSE_TIMEOUT = 15 * time.Second
-var RETRY_TIMEOUT = 1 * time.Second
+
+// Wait between retires while connecting to server
+const RETRY_TIMEOUT = 1 * time.Second
 
 type paxosNode struct {
 	// TODO: implement this!
-	listener               net.Listener
-	hostMap                map[int]string
-	srvID, lastProposalNum int
-	isReplacement          bool
-	myHostPort             string
-	connections            map[int]*rpc.Client
+	listener          net.Listener
+	srvID             int
+	isReplacement     bool
+	myHostPort        string
+	connections       map[int]*rpc.Client
+	lastProposalNums  map[int]int
+	lastAcceptedValue map[string]proposalValueStruct
+	keyProposalMap    map[string]int
+	committedValues   map[string]interface{}
+}
+
+// This struct is a tuple of proposal numbers and values
+type proposalValueStruct struct {
+	n     int
+	value interface{}
 }
 
 // Desc:
@@ -41,41 +54,47 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 	var node *paxosNode
 	node = new(paxosNode)
 
+	// Start the server
 	var err error = nil
 	node.listener, err = net.Listen("tcp", myHostPort)
 	if err != nil {
 		fmt.Println("Error listening:", err)
 		return nil, err
 	}
+	// Register the RPCs
 	rpcServer := rpc.NewServer()
 	rpcServer.Register(paxosrpc.Wrap(node))
 	http.DefaultServeMux = http.NewServeMux()
 	rpcServer.HandleHTTP(rpc.DefaultRPCPath, rpc.DefaultDebugPath)
 	go http.Serve(node.listener, nil)
 
+	// Make maps and channels
 	node.connections = make(map[int]*rpc.Client)
-	node.hostMap = make(map[int]string)
+	node.lastProposalNums = make(map[int]int)
+	node.keyProposalMap = make(map[string]int)
+	node.lastAcceptedValue = make(map[string]proposalValueStruct)
+	node.committedValues = make(map[string]interface{})
 
-	for k, v := range hostMap {
+	// Connect to other nodes
+	for index, addr := range hostMap {
 		for i := 0; i < numRetries; i++ {
-			conn, err := rpc.DialHTTP("tcp", v)
+			conn, err := rpc.DialHTTP("tcp", addr)
 			if err != nil {
 				if i == numRetries {
-					return nil, errors.New("Could not connect to" + string(k))
+					return nil, errors.New("Could not connect to" + string(index))
 				}
 				time.Sleep(RETRY_TIMEOUT)
 				continue
 			} else {
-				node.connections[k] = conn
+				node.connections[index] = conn
 				break
 			}
 		}
 	}
 
 	node.myHostPort = myHostPort
-	node.hostMap = hostMap
 	node.srvID = srvID
-	node.lastProposalNum = srvID
+	node.lastProposalNums[srvID] = srvID
 	node.isReplacement = replace
 
 	return node, nil
@@ -89,12 +108,14 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 // Params:
 // args: the key to propose
 // reply: the next proposal number for the given key
+
+// Proposal number logic taken from:
+// https://stackoverflow.com/questions/47967772/how-to-derive-a-sequence-number-in-paxos
 func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, reply *paxosrpc.ProposalNumberReply) error {
-	nextProposalNum := pn.lastProposalNum*len(pn.hostMap) + pn.lastProposalNum
-	pn.lastProposalNum = nextProposalNum
+	nextProposalNum := pn.lastProposalNums[pn.srvID]*len(pn.connections) + pn.lastProposalNums[pn.srvID]
+	pn.lastProposalNums[pn.srvID] = nextProposalNum
 	reply.N = nextProposalNum
 	return nil
-	// return errors.New("not implemented")
 }
 
 // Desc:
@@ -106,7 +127,52 @@ func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, re
 // args: the key, value pair to propose together with the proposal number returned by GetNextProposalNumber
 // reply: value that was actually committed for the given key
 func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply) error {
-	return errors.New("not implemented")
+	totalOk := 0
+	// Tell everyone to prepare
+	for _, otherNode := range pn.connections {
+		var pa *paxosrpc.PrepareArgs = new(paxosrpc.PrepareArgs)
+		var pr *paxosrpc.PrepareReply = new(paxosrpc.PrepareReply)
+		pa.Key = args.Key
+		pa.N = args.N
+		pa.RequesterId = pn.srvID
+		otherNode.Call("PaxosNode.RecvPrepare", pa, pr)
+		// Wait for replies from nodes
+		if pr.Status == paxosrpc.OK {
+			totalOk++
+		}
+	}
+	if totalOk > (len(pn.connections)/2)+1 {
+		// We got majority so let's get this accepted
+		totalOk = 0
+		for _, otherNode := range pn.connections {
+			var pa *paxosrpc.AcceptArgs = new(paxosrpc.AcceptArgs)
+			var pr *paxosrpc.AcceptReply = new(paxosrpc.AcceptReply)
+			pa.Key = args.Key
+			pa.N = args.N
+			pa.V = args.V
+			pa.RequesterId = pn.srvID
+			otherNode.Call("PaxosNode.RecvAccept", pa, pr)
+			// Wait for replies for accept
+			if pr.Status == paxosrpc.OK {
+				totalOk++
+			}
+		}
+	}
+	if totalOk > (len(pn.connections)/2)+1 {
+		totalOk = 0
+		// We got majority so let's get this committed
+		for _, otherNode := range pn.connections {
+			var ca *paxosrpc.CommitArgs = new(paxosrpc.CommitArgs)
+			var cr *paxosrpc.CommitReply = new(paxosrpc.CommitReply)
+			ca.Key = args.Key
+			ca.V = args.V
+			ca.RequesterId = pn.srvID
+			otherNode.Call("PaxosNode.RecvCommit", ca, cr)
+		}
+		// Send reply to caller
+		reply.V = args.V
+	}
+	return nil
 }
 
 // Desc:
@@ -117,7 +183,15 @@ func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.Propose
 // args: the key to check
 // reply: the value and status for this lookup of the given key
 func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetValueReply) error {
-	return errors.New("not implemented")
+	// Check if key exists or not and then reply appropriately
+	if v, ok := pn.committedValues[args.Key]; ok {
+		reply.Status = paxosrpc.KeyFound
+		reply.V = v
+	} else {
+		reply.Status = paxosrpc.KeyNotFound
+		reply.V = nil
+	}
+	return nil
 }
 
 // Desc:
@@ -130,7 +204,26 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 // args: the Prepare Message, you must include RequesterId when you call this API
 // reply: the Prepare Reply Message
 func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.PrepareReply) error {
-	return errors.New("not implemented")
+	// Check if we have seen the value
+	if _, ok := pn.keyProposalMap[args.Key]; ok {
+		// If we already accepted a proposal with higher proposal number
+		// Then reject this proposal
+		if pn.keyProposalMap[args.Key] > args.N {
+			reply.Status = paxosrpc.Reject
+			// If we have smaller proposal number, then accept it
+		} else {
+			reply.N_a = pn.lastAcceptedValue[args.Key].n
+			reply.V_a = pn.lastAcceptedValue[args.Key].value
+			reply.Status = paxosrpc.OK
+		}
+	} else {
+		// If we haven't seen this proposal ever, we going to accept it
+		reply.N_a = -1
+		reply.V_a = nil
+		reply.Status = paxosrpc.OK
+		pn.keyProposalMap[args.Key] = args.N
+	}
+	return nil
 }
 
 // Desc:
@@ -143,7 +236,15 @@ func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.Pre
 // args: the Please Accept Message, you must include RequesterId when you call this API
 // reply: the Accept Reply Message
 func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.AcceptReply) error {
-	return errors.New("not implemented")
+	// Check if we promised to accept value for this key or not
+	if _, ok := pn.keyProposalMap[args.Key]; ok {
+		pn.lastAcceptedValue[args.Key] = proposalValueStruct{args.N, args.V}
+		reply.Status = paxosrpc.OK
+	} else {
+		// If we did not promise, then reject
+		reply.Status = paxosrpc.Reject
+	}
+	return nil
 }
 
 // Desc:
@@ -155,7 +256,9 @@ func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.Accep
 // args: the Commit Message, you must include RequesterId when you call this API
 // reply: the Commit Reply Message
 func (pn *paxosNode) RecvCommit(args *paxosrpc.CommitArgs, reply *paxosrpc.CommitReply) error {
-	return errors.New("not implemented")
+	// Commit the value in our own key value store
+	pn.committedValues[args.Key] = args.V
+	return nil
 }
 
 // Desc:
