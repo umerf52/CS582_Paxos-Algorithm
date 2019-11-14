@@ -28,6 +28,7 @@ type paxosNode struct {
 	lastAcceptedValue map[string]proposalValueStruct
 	keyProposalMap    map[string]int
 	committedValues   map[string]interface{}
+	//proposeChan       chan bool
 }
 
 // This struct is a tuple of proposal numbers and values
@@ -74,6 +75,7 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 	node.keyProposalMap = make(map[string]int)
 	node.lastAcceptedValue = make(map[string]proposalValueStruct)
 	node.committedValues = make(map[string]interface{})
+	//node.proposeChan = make(chan bool, 1)
 
 	// Connect to other nodes
 	for index, addr := range hostMap {
@@ -126,15 +128,18 @@ func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, re
 // Params:
 // args: the key, value pair to propose together with the proposal number returned by GetNextProposalNumber
 // reply: value that was actually committed for the given key
-func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply) error {
+
+func (pn *paxosNode) proposeWork(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply, proposeChan chan interface{}) {
 	totalOk := 0
 	// Tell everyone to prepare
+
 	for _, otherNode := range pn.connections {
 		var pa *paxosrpc.PrepareArgs = new(paxosrpc.PrepareArgs)
 		var pr *paxosrpc.PrepareReply = new(paxosrpc.PrepareReply)
 		pa.Key = args.Key
 		pa.N = args.N
 		pa.RequesterId = pn.srvID
+
 		otherNode.Call("PaxosNode.RecvPrepare", pa, pr)
 		// Wait for replies from nodes
 		if pr.Status == paxosrpc.OK {
@@ -170,9 +175,29 @@ func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.Propose
 			otherNode.Call("PaxosNode.RecvCommit", ca, cr)
 		}
 		// Send reply to caller
-		reply.V = args.V
+		proposeChan <- args.V
+	}
+}
+
+//We have the actual Propose implementation in proposeWork.
+//here we call proposeWork in a goroutine and also set a ticker for 15 seconds
+//In a select, we wait for a response on either of the two channels i.e. if the RPC has returned,
+//on its channel then simply return nil and continue
+// else return the timeout error.
+func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply) error {
+	proposeChan := make(chan interface{})
+	ticker := time.NewTicker(PROPOSE_TIMEOUT)
+	go pn.proposeWork(args, reply, proposeChan)
+	select {
+	case temp := <-proposeChan:
+		reply.V = temp
+
+	case <-ticker.C:
+		ticker.Stop()
+		return errors.New("Prepare RPC timed out")
 	}
 	return nil
+
 }
 
 // Desc:
@@ -205,6 +230,7 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 // reply: the Prepare Reply Message
 func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.PrepareReply) error {
 	// Check if we have seen the value
+	//time.Sleep(16 * time.Second)
 	if _, ok := pn.keyProposalMap[args.Key]; ok {
 		// If we already accepted a proposal with higher proposal number
 		// Then reject this proposal
