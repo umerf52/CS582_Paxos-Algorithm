@@ -1,34 +1,37 @@
-// High level logic discussed with 2020-10-0231
+// Partner 1: 2020-10-0287
+// Partner 2: 2020-10-0148
+
 package paxos
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/rpc"
 	"paxosapp/rpc/paxosrpc"
+	"sync"
 	"time"
 )
 
-// Time after Propose() fails
-var PROPOSE_TIMEOUT = 15 * time.Second
+// proposeTimeout: Time after Propose() fails
+var proposeTimeout = 15 * time.Second
 
 // Wait between retires while connecting to server
-const RETRY_TIMEOUT = 1 * time.Second
+const retryTimeout = 1 * time.Second
 
 type paxosNode struct {
-	// TODO: implement this!
-	listener          net.Listener
-	srvID             int
-	isReplacement     bool
-	myHostPort        string
-	connections       map[int]*rpc.Client
-	lastProposalNums  map[int]int
-	lastAcceptedValue map[string]proposalValueStruct
-	keyProposalMap    map[string]int
-	committedValues   map[string]interface{}
-	//proposeChan       chan bool
+	listener                                                                                         net.Listener
+	srvID, numRetries                                                                                int
+	isReplacement                                                                                    bool
+	myHostPort                                                                                       string
+	connections                                                                                      map[int]*rpc.Client
+	lastProposalNums                                                                                 map[int]int                    //latest proposal num for a node
+	lastAcceptedValue                                                                                map[string]proposalValueStruct //latest accepted val for a key
+	keyProposalMap                                                                                   map[string]int                 //latest accepted proposal num for a key
+	committedValues, commitTemp                                                                      map[string]interface{}
+	commitLock, connLock, poposalNumsLock, lastAcceptedValueLock, commitTempLock, keyProposalMapLock *sync.Mutex
 }
 
 // This struct is a tuple of proposal numbers and values
@@ -37,7 +40,7 @@ type proposalValueStruct struct {
 	value interface{}
 }
 
-// Desc:
+// NewPaxosNode Desc:
 // NewPaxosNode creates a new PaxosNode. This function should return only when
 // all nodes have joined the ring, and should return a non-nil error if this node
 // could not be started in spite of dialing any other nodes numRetries times.
@@ -54,6 +57,7 @@ type proposalValueStruct struct {
 func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, numRetries int, replace bool) (PaxosNode, error) {
 	var node *paxosNode
 	node = new(paxosNode)
+	node.numRetries = numRetries
 
 	// Start the server
 	var err error = nil
@@ -74,10 +78,9 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 	node.lastProposalNums = make(map[int]int)
 	node.keyProposalMap = make(map[string]int)
 	node.lastAcceptedValue = make(map[string]proposalValueStruct)
-	node.committedValues = make(map[string]interface{})
-	//node.proposeChan = make(chan bool, 1)
+	node.committedValues, node.commitTemp = make(map[string]interface{}), make(map[string]interface{})
+	node.keyProposalMapLock, node.commitLock, node.connLock, node.commitTempLock, node.poposalNumsLock, node.lastAcceptedValueLock = &sync.Mutex{}, &sync.Mutex{}, &sync.Mutex{}, &sync.Mutex{}, &sync.Mutex{}, &sync.Mutex{}
 
-	// Connect to other nodes
 	for index, addr := range hostMap {
 		for i := 0; i < numRetries; i++ {
 			conn, err := rpc.DialHTTP("tcp", addr)
@@ -85,20 +88,55 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 				if i == numRetries {
 					return nil, errors.New("Could not connect to" + string(index))
 				}
-				time.Sleep(RETRY_TIMEOUT)
+				time.Sleep(retryTimeout)
 				continue
 			} else {
+				node.connLock.Lock()
 				node.connections[index] = conn
+				node.connLock.Unlock()
+
 				break
 			}
 		}
 	}
-
+	node.poposalNumsLock.Lock()
 	node.myHostPort = myHostPort
 	node.srvID = srvID
 	node.lastProposalNums[srvID] = srvID
 	node.isReplacement = replace
+	node.poposalNumsLock.Unlock()
 
+	if node.isReplacement {
+
+		// Start notifying others that i'm a replacement node
+		for _, v := range node.connections {
+			var pa *paxosrpc.ReplaceServerArgs = new(paxosrpc.ReplaceServerArgs)
+			var pr *paxosrpc.ReplaceServerReply = new(paxosrpc.ReplaceServerReply)
+			pa.Hostport = node.myHostPort
+			pa.SrvID = node.srvID
+			v.Call("PaxosNode.RecvReplaceServer", pa, pr)
+
+		}
+		// contact other nodes for their committedValues map information and copy them
+		// in my own map
+		for _, v := range node.connections {
+			var pa *paxosrpc.ReplaceCatchupArgs = new(paxosrpc.ReplaceCatchupArgs)
+			var pr *paxosrpc.ReplaceCatchupReply = new(paxosrpc.ReplaceCatchupReply)
+
+			v.Call("PaxosNode.RecvReplaceCatchup", pa, pr)
+
+			tempMap := make(map[string]uint32)
+			err := json.Unmarshal(pr.Data, &tempMap)
+			if err != nil {
+				return nil, err
+			}
+			node.commitLock.Lock()
+			for k, v := range tempMap {
+				node.committedValues[k] = v
+			}
+			node.commitLock.Unlock()
+		}
+	}
 	return node, nil
 }
 
@@ -114,16 +152,28 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 // Proposal number logic taken from:
 // https://stackoverflow.com/questions/47967772/how-to-derive-a-sequence-number-in-paxos
 func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, reply *paxosrpc.ProposalNumberReply) error {
+	pn.poposalNumsLock.Lock()
+	pn.connLock.Lock()
 	nextProposalNum := pn.lastProposalNums[pn.srvID]*len(pn.connections) + pn.lastProposalNums[pn.srvID]
 	pn.lastProposalNums[pn.srvID] = nextProposalNum
 	reply.N = nextProposalNum
+	pn.poposalNumsLock.Unlock()
+	pn.connLock.Unlock()
 	return nil
 }
 
 // Desc:
 // Propose initializes proposing a value for a key, and replies with the
 // value that was committed for that key. Propose should not return until
-// a value has been committed, or PROPOSE_TIMEOUT seconds have passed.
+// a value has been committed, either its own or it waits for
+// some other value to be committed (in case it doesn't get a majority) and returns that.
+// If proposeTimeout seconds pass then timeout and returns an error.
+//
+
+// In case a proposer doesn't get a majority, it starts waiting until theres a value against
+// the key in the temporary commit map. Once it gets the value, it returns it and then
+// deletes the corresponding value from the map so that the next time a new value is commmitted
+// and is put into the map, it ensures the latest committed value is only received.
 //
 // Params:
 // args: the key, value pair to propose together with the proposal number returned by GetNextProposalNumber
@@ -132,7 +182,7 @@ func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, re
 func (pn *paxosNode) proposeWork(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply, proposeChan chan interface{}) {
 	totalOk := 0
 	// Tell everyone to prepare
-
+	pn.connLock.Lock()
 	for _, otherNode := range pn.connections {
 		var pa *paxosrpc.PrepareArgs = new(paxosrpc.PrepareArgs)
 		var pr *paxosrpc.PrepareReply = new(paxosrpc.PrepareReply)
@@ -162,7 +212,21 @@ func (pn *paxosNode) proposeWork(args *paxosrpc.ProposeArgs, reply *paxosrpc.Pro
 				totalOk++
 			}
 		}
+	} else {
+		for {
+			time.Sleep(retryTimeout * 2)
+			pn.commitTempLock.Lock()
+			if v, ok := pn.commitTemp[args.Key]; ok {
+				proposeChan <- v
+				delete(pn.commitTemp, args.Key)
+				pn.commitTempLock.Unlock()
+				pn.connLock.Unlock()
+				return
+			}
+			pn.commitTempLock.Unlock()
+		}
 	}
+
 	if totalOk > (len(pn.connections)/2)+1 {
 		totalOk = 0
 		// We got majority so let's get this committed
@@ -176,7 +240,21 @@ func (pn *paxosNode) proposeWork(args *paxosrpc.ProposeArgs, reply *paxosrpc.Pro
 		}
 		// Send reply to caller
 		proposeChan <- args.V
+	} else {
+		for {
+			time.Sleep(time.Second * 2)
+			pn.commitTempLock.Lock()
+			if v, ok := pn.commitTemp[args.Key]; ok {
+				proposeChan <- v
+				delete(pn.commitTemp, args.Key)
+				pn.commitTempLock.Unlock()
+				pn.connLock.Unlock()
+				return
+			}
+			pn.commitTempLock.Unlock()
+		}
 	}
+	pn.connLock.Unlock()
 }
 
 //We have the actual Propose implementation in proposeWork.
@@ -186,8 +264,9 @@ func (pn *paxosNode) proposeWork(args *paxosrpc.ProposeArgs, reply *paxosrpc.Pro
 // else return the timeout error.
 func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply) error {
 	proposeChan := make(chan interface{})
-	ticker := time.NewTicker(PROPOSE_TIMEOUT)
+	ticker := time.NewTicker(proposeTimeout)
 	go pn.proposeWork(args, reply, proposeChan)
+
 	select {
 	case temp := <-proposeChan:
 		reply.V = temp
@@ -197,7 +276,6 @@ func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.Propose
 		return errors.New("Prepare RPC timed out")
 	}
 	return nil
-
 }
 
 // Desc:
@@ -209,6 +287,7 @@ func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.Propose
 // reply: the value and status for this lookup of the given key
 func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetValueReply) error {
 	// Check if key exists or not and then reply appropriately
+	pn.commitLock.Lock()
 	if v, ok := pn.committedValues[args.Key]; ok {
 		reply.Status = paxosrpc.KeyFound
 		reply.V = v
@@ -216,6 +295,8 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 		reply.Status = paxosrpc.KeyNotFound
 		reply.V = nil
 	}
+	pn.commitLock.Unlock()
+
 	return nil
 }
 
@@ -230,7 +311,7 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 // reply: the Prepare Reply Message
 func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.PrepareReply) error {
 	// Check if we have seen the value
-	//time.Sleep(16 * time.Second)
+	pn.keyProposalMapLock.Lock()
 	if _, ok := pn.keyProposalMap[args.Key]; ok {
 		// If we already accepted a proposal with higher proposal number
 		// Then reject this proposal
@@ -238,8 +319,13 @@ func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.Pre
 			reply.Status = paxosrpc.Reject
 			// If we have smaller proposal number, then accept it
 		} else {
+			pn.keyProposalMap[args.Key] = args.N
+
+			pn.lastAcceptedValueLock.Lock()
 			reply.N_a = pn.lastAcceptedValue[args.Key].n
 			reply.V_a = pn.lastAcceptedValue[args.Key].value
+			pn.lastAcceptedValueLock.Unlock()
+
 			reply.Status = paxosrpc.OK
 		}
 	} else {
@@ -249,6 +335,8 @@ func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.Pre
 		reply.Status = paxosrpc.OK
 		pn.keyProposalMap[args.Key] = args.N
 	}
+	pn.keyProposalMapLock.Unlock()
+
 	return nil
 }
 
@@ -263,13 +351,22 @@ func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.Pre
 // reply: the Accept Reply Message
 func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.AcceptReply) error {
 	// Check if we promised to accept value for this key or not
-	if _, ok := pn.keyProposalMap[args.Key]; ok {
-		pn.lastAcceptedValue[args.Key] = proposalValueStruct{args.N, args.V}
-		reply.Status = paxosrpc.OK
+	pn.keyProposalMapLock.Lock()
+	if minProp, ok := pn.keyProposalMap[args.Key]; ok {
+
+		if args.N >= minProp {
+			pn.lastAcceptedValueLock.Lock()
+			pn.lastAcceptedValue[args.Key] = proposalValueStruct{args.N, args.V}
+			pn.lastAcceptedValueLock.Unlock()
+			reply.Status = paxosrpc.OK
+		} else {
+			reply.Status = paxosrpc.Reject
+		}
 	} else {
 		// If we did not promise, then reject
 		reply.Status = paxosrpc.Reject
 	}
+	pn.keyProposalMapLock.Unlock()
 	return nil
 }
 
@@ -277,13 +374,22 @@ func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.Accep
 // Receive a Commit message from another Paxos Node. The message contains
 // the key whose value was proposed by the node sending the commit
 // message.
+// Commit the value in another temporary map, this is to signal the waiting proposer
+// who didn't get a majority. This way, once it sees that this map has a value
+// it means its committed and it can return it.
 //
 // Params:
 // args: the Commit Message, you must include RequesterId when you call this API
 // reply: the Commit Reply Message
 func (pn *paxosNode) RecvCommit(args *paxosrpc.CommitArgs, reply *paxosrpc.CommitReply) error {
 	// Commit the value in our own key value store
+	pn.commitLock.Lock()
 	pn.committedValues[args.Key] = args.V
+	pn.commitTempLock.Lock()
+	pn.commitTemp[args.Key] = args.V
+	pn.commitTempLock.Unlock()
+	pn.commitLock.Unlock()
+
 	return nil
 }
 
@@ -292,11 +398,30 @@ func (pn *paxosNode) RecvCommit(args *paxosrpc.CommitArgs, reply *paxosrpc.Commi
 // message contains the Server ID of the node being replaced, and the
 // hostport of the replacement node
 //
+
+// The receiving server gets to know of the replacement node, dials the connection
+// and modifies its connections map accordingly
+//
 // Params:
 // args: the id and the hostport of the server being replaced
 // reply: no use
 func (pn *paxosNode) RecvReplaceServer(args *paxosrpc.ReplaceServerArgs, reply *paxosrpc.ReplaceServerReply) error {
-	return errors.New("not implemented")
+	for i := 0; i < pn.numRetries; i++ {
+		conn, err := rpc.DialHTTP("tcp", args.Hostport)
+		if err != nil {
+			if i == pn.numRetries {
+				break
+			}
+			time.Sleep(retryTimeout)
+			continue
+		} else {
+			pn.connLock.Lock()
+			pn.connections[args.SrvID] = conn
+			pn.connLock.Unlock()
+			break
+		}
+	}
+	return nil
 }
 
 // Desc:
@@ -305,9 +430,20 @@ func (pn *paxosNode) RecvReplaceServer(args *paxosrpc.ReplaceServerArgs, reply *
 // needed to make the replacement server aware of the keys and values
 // committed so far.
 //
+// Here we just marshall the committedValues map and send it in the reply
+//
+//
 // Params:
 // args: no use
 // reply: a byte array containing necessary data used by replacement server to recover
 func (pn *paxosNode) RecvReplaceCatchup(args *paxosrpc.ReplaceCatchupArgs, reply *paxosrpc.ReplaceCatchupReply) error {
-	return errors.New("not implemented")
+	pn.commitLock.Lock()
+	marshalled, err := json.Marshal(pn.committedValues)
+	if err != nil {
+		return err
+	}
+	reply.Data = marshalled
+	pn.commitLock.Unlock()
+
+	return nil
 }
